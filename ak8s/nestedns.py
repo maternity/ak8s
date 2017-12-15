@@ -67,24 +67,9 @@ class NS:
         self._data[k] = v
 
     def __getitem__(self, k):
-        return self._data[k]
-
-    def __delitem__(self, k):
-        del self._data[k]
-
-    def __iter__(self):
-        yield from self._lazy
-        yield from self._data
-
-    def __contains__(self, k):
-        return k in self._data
-
-    def __getattr__(self, k):
-        if k in self:
-            return self[k]
-        if k in self._prefixes:
-            return SubNS(self, k)
-        if self._missing is not None:
+        if k in self._data:
+            return self._data[k]
+        if k not in self._prefixes and self._missing is not None:
             try:
                 v = self._missing(k)
             except LookupError:
@@ -92,6 +77,22 @@ class NS:
             else:
                 self[k] = v
                 return v
+        raise KeyError(k)
+
+    def __delitem__(self, k):
+        del self._data[k]
+
+    def __iter__(self):
+        yield from self._lazy|set(self._data)
+
+    def __contains__(self, k):
+        return k in self._data or k in self._lazy
+
+    def __getattr__(self, k):
+        if k in self:
+            return self[k]
+        if k in self._prefixes:
+            return SubNS(self, k)
         raise AttributeError(k)
 
     def __dir__(self):
@@ -114,14 +115,6 @@ class SubNS:
             return self._ns[fqk]
         if fqk in self._ns._prefixes:
             return SubNS(self._ns, fqk)
-        if self._ns._missing is not None:
-            try:
-                v = self._ns._missing(fqk)
-            except LookupError:
-                pass
-            else:
-                self._ns[fqk] = v
-                return v
         raise AttributeError(k)
 
     def __dir__(self):
