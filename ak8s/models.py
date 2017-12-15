@@ -17,20 +17,15 @@ import json
 import textwrap
 
 from .nestedns import NS
+from .boilerplate import boilerplate
 
 
-def import_models(types, spec):
-    models = spec['models']
-    for mname,mdesc in models.items():
-        types.define(mname, mdesc)
-
-
-def mklens(pdesc, *, types):
+def mklens(pdesc, *, registry):
     if '$ref' in pdesc:
-        return ModelLens(pdesc, types=types)
+        return ModelLens(pdesc, registry=registry)
     
     if pdesc['type'] == 'array':
-        itemlens = mklens(pdesc['items'], types=types)
+        itemlens = mklens(pdesc['items'], registry=registry)
         return ListLens._binditem(itemlens, pdesc)
 
     return SimpleLens(pdesc)
@@ -51,16 +46,16 @@ class SimpleLens:
 
 
 class ModelLens:
-    def __init__(self, desc, *, types):
+    def __init__(self, desc, *, registry):
         if 'description' in desc:
             self.__doc__ = desc['description']
-        self._types = types
+        self._models = registry.models
         self._ref = desc['$ref']
         self._model = None
 
     def _project(self, data):
         if self._model is None:
-            self._model = self._types.models[self._ref]
+            self._model = self._models[self._ref]
         lens = object.__new__(self._model)
         lens._data = data
         return lens
@@ -85,12 +80,11 @@ class ModelRegistry:
         self.models = NS(missing=self._get_model)
         self._model_desc = {}
 
-    def __repr__(self):
-        models = []
-        for name in self._model_desc:
-            flag = '*' if name in self.models else ''
-            models.append(f'{flag}{name}')
-        return f'<{self.__class__.__qualname__} [{" ".join(models)}]>'
+    def load_spec(self, pth):
+        with open(pth) as fh:
+            for ln in fh:
+                spec = json.loads(ln)
+                self.add_spec(spec)
 
     def add_spec(self, spec):
         for desc in spec['models'].values():
@@ -98,7 +92,11 @@ class ModelRegistry:
 
     def add_model_desc(self, desc):
         if desc['id'] in self._model_desc:
-            raise KeyError('Spec for {desc["id"]} is already registered')
+            # Some models appear in multiple APIs, if the specs don't differ,
+            # then ignore it.
+            if desc == self._model_desc[desc['id']]:
+                return
+            raise KeyError(f'Spec for {desc["id"]} is already registered')
         self._model_desc[desc['id']] = desc
         self.models._declare_lazy(desc['id'])
 
@@ -108,24 +106,21 @@ class ModelRegistry:
     def _register_model(self, model):
         if not issubclass(model, ModelBase):
             raise TypeError('Only ModelBase derived models can be registered.')
-        if model.__name__ in self.models:
-            raise KeyError('A {model.__name__!r} model already exists.')
         self.models[model.__name__] = model
         return model
 
     def _get_model(self, name):
-        if name not in self.models:
-            class Model(ModelBase, types=self, name=name):
-                __slots__ = ()
-        return self.models[name]
+        class Model(ModelBase, registry=self, name=name):
+            __slots__ = ()
+        return Model
 
 
 class ModelBase:
     __slots__ = '_data',
 
-    def __init_subclass__(cls, *, types, name, **kw):
+    def __init_subclass__(cls, *, registry, name, **kw):
         super().__init_subclass__(**kw)
-        desc = types._get_model_desc(name)
+        desc = registry._get_model_desc(name)
         cls.__qualname__ = cls.__name__ = name
         cls._desc = desc
 
@@ -136,7 +131,7 @@ class ModelBase:
         cls.__doc__ = f'{doc}\n\n'
 
         for pname,pdesc in desc['properties'].items():
-            lens = mklens(pdesc, types=types)
+            lens = mklens(pdesc, registry=registry)
             prop = LensProp(lens, pdesc)
             setattr(cls, pname, prop)
             # Apparently __init_subclass__ is too late for __set_name__ to
@@ -154,11 +149,11 @@ class ModelBase:
             else:
                 cls.__doc__ += f'{pname}\n'
 
-        types._register_model(cls)
+        registry._register_model(cls)
 
     def __init__(self, **kw):
         # values in kw are cooked
-        self._data = {}
+        self._data = boilerplate.get(self.__class__.__name__, dict)()
         for k,v in kw.items():
             setattr(self, k, v)
 
@@ -178,8 +173,11 @@ class ModelBase:
         preprs = []
         for pname in self._desc['properties']:
             if pname in self._data:
-                pval = getattr(self, pname)
-                preprs.append(f'{pname}={pval!r}')
+                try:
+                    pval = getattr(self, pname)
+                    preprs.append(f'{pname}={pval!r}')
+                except Exception as e:
+                    preprs.append(f'{pname}! {e!r}')
 
         return f'{self.__class__.__name__}({", ".join(preprs)})'
 
@@ -360,8 +358,5 @@ if __name__ == '__main__':
     parser.add_argument('spec', metavar='SPEC')
     args = parser.parse_args()
 
-    types = ModelRegistry()
-    with open(args.spec) as fh:
-        spec = json.load(fh)
-        types.add_spec(spec)
-
+    registry = ModelRegistry()
+    registry.load_spec(args.spec)
