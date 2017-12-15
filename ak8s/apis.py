@@ -16,6 +16,7 @@ import argparse
 from inspect import Parameter
 from inspect import Signature
 import json
+from pathlib import Path
 import re
 import textwrap
 from urllib.parse import urlencode
@@ -46,12 +47,22 @@ from .nestedns import NS
 
 
 class K8sAPIOperation:
-    def __init_subclass__(cls, *, name, registry, **kw):
+    # class attrs
+    name = None
+    version = None
+    method = None
+    path = None
+
+    def __init_subclass__(cls, *, version=None, name=None, registry=None, **kw):
         super().__init_subclass__(**kw)
 
-        apidesc, opdesc = registry._get_api_desc(name)
+        if not version and not name and not registry:
+            return
 
-        cls.__qualname__ = cls.__name__ = opdesc['nickname']
+        apidesc, opdesc = registry._get_api_desc(version, name)
+
+        cls.__qualname__ = cls.__name__ = cls.name = name
+        cls.version = version
         cls.method = opdesc['method']
         cls.path = apidesc['path']
         cls._consumes = set(opdesc['consumes'])
@@ -91,7 +102,7 @@ class K8sAPIOperation:
             cls.response_model = None
 
         else:
-            cls.response_model = registry.get_model(opdesc['type'])
+            cls.response_model = registry.models[opdesc['type']]
 
         cls.__doc__ = f'{opdesc["summary"]}\n\n'
         cls.__doc__ += f'    {opdesc["method"]} {apidesc["path"]} -> {opdesc["type"]}\n\n'
@@ -106,16 +117,25 @@ class K8sAPIOperation:
 
         registry._register_api(cls)
 
+    # instance attrs
+    stream = False
+    uri = None
+    body = None
+    args = None
+
     def __init__(self, *a, **kw):
         # Not using Signature.bind() here because we want to treat the query
         # params as optional, without using a default.
         bound = self.__signature__.bind_partial(*a, **kw)
+
+        self.args = bound.arguments.copy()
+
         if self._body_param:
             body = bound.arguments.pop(self._body_param['name'])
         else:
             body = None
 
-        for k,v in kw.items():
+        for k in bound.kwargs:
             if k not in self._query_params:
                 raise TypeError(f'got an unexpected keyword argument {k!r}')
 
@@ -126,12 +146,35 @@ class K8sAPIOperation:
                     self.path)
         except KeyError as e:
             raise TypeError(f'missing required argument {e!s}')
-        query = urlencode(kw)
+        query = urlencode(bound.kwargs)
         self.uri = urlunsplit(('', '', path_, query, ''))
         self.body = body
 
     def __repr__(self):
         return f'<{self.__class__.__name__}: {self.uri}>'
+
+    def __eq__(self, them):
+        if isinstance(them, self.__class__):
+            return self.args == them.args
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(tuple(self.args.items()))
+
+    def replace(self, *a, **kw):
+        '''Derive a copy of this operation with some arguments replaced.
+
+        >>> registry.apis.list_namespaced_pod(namespace='default', watch=True)
+        <listNamespacedPod: /api/v1/namespaces/default/pods?watch=True>
+        >>> _.replace(resourceVersion='10')
+        <listNamespacedPod: /api/v1/namespaces/default/pods?watch=True&resourceVersion=10>
+        '''
+
+        # TODO: There should be a way to unset an option.
+
+        bound = self.__signature__.bind_partial(*a, **kw)
+        args = {**self.args, **bound.arguments}
+        return self.__class__(**args)
 
     def body_as(self, content_type=None):
         '''Returns (headers, body).'''
@@ -159,9 +202,9 @@ class K8sAPIOperation:
             body = json.dumps(self.body._data).encode('ascii')
 
         headers['content-type'] = content_type
-        headers['content-length'] = len(body)
+        headers['content-length'] = str(len(body))
 
-        return headers, iter([body])
+        return headers, body
 
 
 class APIRegistry(ModelRegistry):
@@ -173,54 +216,95 @@ class APIRegistry(ModelRegistry):
     >>> registry.add_spec(spec)
     >>> registry.models.v1.Container
     <class 'models.v1.Container'>
-    >>> registry.apis.listNamespacedPod
+    >>> registry.apis['v1'].list_namespaced_pod
     <class 'apis.listNamespacedPod'>
     '''
 
     def __init__(self):
         super().__init__()
-        self.apis = NS(missing=self._get_api)
+        self.apis = dict()
         self._api_desc = {}
-
-    def __repr__(self):
-        apis = []
-        for name in self._api_desc:
-            flag = '*' if name in self.apis else ''
-            apis.append(f'{flag}{name}')
-        return f'<{self.__class__.__qualname__} [{" ".join(apis)}]>'
+        self._api_bases = []
 
     def add_spec(self, spec):
         super().add_spec(spec)
+        _fixup_path_path_params(spec)
+        version = spec['apiVersion']
+        if version not in self.apis:
+            self.apis[version] = NS(
+                    missing=lambda name: self._get_api(version, name))
         for apidesc in spec['apis']:
             for opdesc in apidesc['operations']:
-                self.add_api_desc(apidesc, opdesc)
+                self.add_api_desc(apidesc, opdesc, version=version)
 
-    def add_api_desc(self, apidesc, opdesc):
+    def add_api_desc(self, apidesc, opdesc, *, version):
         name = camel2snake(opdesc['nickname'])
-        if name in self._api_desc:
-            raise KeyError('Spec for {name} is already registered')
-        self._api_desc[name] = apidesc, opdesc
-        self.apis._declare_lazy(name)
+        if (version, name) in self._api_desc:
+            print(f'Spec for {version, name} is already registered')
+            return
+            raise KeyError(f'Spec for {version, name} is already registered')
+        self._api_desc[version, name] = apidesc, opdesc
+        self.apis[version]._declare_lazy(name)
 
-    def _get_api_desc(self, name):
-        return self._api_desc[name]
+    def _get_api_desc(self, version, name):
+        return self._api_desc[version, name]
 
     def _register_api(self, api):
         if not issubclass(api, K8sAPIOperation):
             raise TypeError('Only K8sAPIOperation derived APIs can be registered.')
-        name = camel2snake(api.__name__)
-        if name in self.apis:
-            raise KeyError('A {name!r} api already exists.')
-        self.apis[name] = api
+        name = camel2snake(api.name)
+        self.apis[api.version][name] = api
         return api
 
-    def _get_api(self, name):
-        if name not in self.apis:
-            class API(K8sAPIOperation,
-                    registry=self,
-                    name=name):
-                pass
-        return self.apis[name]
+    def _get_api(self, version, name):
+        for predicate, base_class in self._api_bases:
+            if predicate(self, version, name):
+                break
+
+        else:
+            base_class = K8sAPIOperation
+
+        class API(
+                base_class,
+                registry=self,
+                version=version,
+                name=name):
+            pass
+        return self.apis[version][name]
+
+    def add_api_base(self, predicate, base_class=None):
+        '''Register a base class to be used for APIs when predicate matches.
+
+        The predicate signature is:
+
+            predicate(registry, version, name)
+
+        Predicates are evaluated in the reverse order they were registered in.
+        '''
+
+        if isinstance(predicate, str):
+            predicate = (lambda regex: lambda reg, ver, nam: re.fullmatch(regex, f'{ver}/{nam}'))(predicate)
+
+        def register(base_class):
+            self._api_bases.insert(0, (predicate, base_class))
+            return base_class
+
+        if base_class is not None:
+            register(base_class)
+        else:
+            return register
+
+
+class StreamingMixin:
+    stream = True
+
+    @classmethod
+    def bind_stream_condition(cls, condition):
+        class StreamingMixin(cls):
+            @property
+            def stream(self):
+                return bool(condition(self))
+        return StreamingMixin
 
 
 def format_param_doc(desc):
@@ -236,7 +320,7 @@ def format_param_doc(desc):
     return f'    {desc["name"]} ({desc["type"]})\n\n'
 
 
-def fixup_path_path_params(spec):
+def _fixup_path_path_params(spec):
     for apidesc in spec['apis']:
         if '{path}' in apidesc['path']:
             # Change {path} to {path_} and update corresponding parameters.
@@ -256,13 +340,30 @@ def camel2snake(s):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('spec', metavar='SPEC')
+    parser.add_argument('spec', metavar='SPEC', type=Path, nargs='+')
     args = parser.parse_args()
 
     registry = APIRegistry()
 
-    with open(args.spec) as fh:
-        spec = json.load(fh)
-    fixup_path_path_params(spec)
+    @registry.add_api_base(r'.*/watch\w+')
+    class K8sAPIWatchOperation(StreamingMixin, K8sAPIOperation):
+        pass
 
-    registry.add_spec(spec)
+    @registry.add_api_base(r'.*/(?:read|list)\w+')
+    class K8sAPIReadItemOrCollectionOperation(
+            StreamingMixin.bind_stream_condition(lambda self: self.args.get('watch')),
+            K8sAPIOperation):
+        pass
+
+    @registry.add_api_base(r'.*/readNamespacedPodLogs')
+    class K8sAPIPodLogOperation(
+            StreamingMixin.bind_stream_condition(lambda self: self.args.get('watch')),
+            K8sAPIOperation):
+        pass
+
+    for pth in args.spec:
+        if pth.is_dir():
+            for pth in pth.rglob('*.json'):
+                registry.load_spec(pth)
+        else:
+            registry.load_spec(pth)
