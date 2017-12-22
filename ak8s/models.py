@@ -235,6 +235,11 @@ class ModelBase:
 
         return f'{self.__class__.__name__}({", ".join(preprs)})'
 
+    def __eq__(self, them):
+        if self.__class__ == them.__class__:
+            return self._data == them._data
+        return NotImplemented
+
 
 class LensProp:
     def __init__(self, lens, pdesc):
