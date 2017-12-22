@@ -135,7 +135,8 @@ class AK8sClient:
                 **kw)
 
     async def __aenter__(self):
-        self._session = await aiohttp.ClientSession().__aenter__()
+        self._session = await aiohttp.ClientSession(
+                conn_timeout=60).__aenter__()
         return self
 
     async def __aexit__(self, *exc):
@@ -197,6 +198,7 @@ class AK8sClient:
         async with self._session.request(
                 op.method, url,
                 headers=headers,
+                timeout=None,
                 ssl_context=self._sslcontext) as resp:
             try:
                 resp.raise_for_status()
