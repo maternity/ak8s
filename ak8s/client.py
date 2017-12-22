@@ -25,7 +25,7 @@ import aiohttp
 import yaml
 
 from .apis import APIRegistry
-from .apis import fixup_path_path_params
+from .models import ModelBase
 
 
 async def main():
@@ -35,19 +35,14 @@ async def main():
     args = parser.parse_args()
 
     registry = APIRegistry()
-
-    with open(args.spec) as fh:
-        spec = json.load(fh)
-    fixup_path_path_params(spec)
-
-    registry.add_spec(spec)
+    registry.load_spec(args.spec)
 
     async with AK8sClient.from_kubeconfig(
             args.kubeconfig,
-            models=registry.models) as ak8s:
-        v1_api = ak8s.bind_api_group(registry.apis['v1'])
+            registry=registry) as ak8s:
+        apis = ak8s.bind_api_group(registry.apis)
 
-        async for ev, obj in v1_api.watch_pod_list_for_all_namespaces(
+        async for ev, obj in apis.core_v1.watch_pod_list_for_all_namespaces(
                 includeUninitialized=True):
             print(ev, f'{obj.metadata.name:55}  {obj.metadata.namespace:20}  {obj.status.phase}')
 
@@ -58,14 +53,43 @@ class AK8sClient:
             ca_file,
             client_cert_file,
             client_key_file,
-            models=None):
+            registry):
         sslcontext = ssl.create_default_context(cafile=ca_file)
         sslcontext.load_cert_chain(client_cert_file, client_key_file)
         self._url = url
         self._sslcontext = sslcontext
         self._session = None
-        self._models = models
+        self._models = registry.models_by_gvk
         self._logger = logging.getLogger(self.__class__.__qualname__)
+
+    #TODO: service account config
+
+    # > Accessing the API from a Pod
+    # >
+    # > When accessing the API from a pod, locating and
+    # > authenticating to the apiserver are somewhat different.
+    # >
+    # > The recommended way to locate the apiserver within the pod
+    # > is with the kubernetes DNS name, which resolves to a
+    # > Service IP which in turn will be routed to an apiserver.
+    # >
+    # > The recommended way to authenticate to the apiserver is
+    # > with a service account credential. By kube-system, a pod is
+    # > associated with a service account, and a credential (token)
+    # > for that service account is placed into the filesystem tree
+    # > of each container in that pod, at
+    # > /var/run/secrets/kubernetes.io/serviceaccount/token.
+    # >
+    # > If available, a certificate bundle is placed into the
+    # > filesystem tree of each container at
+    # > /var/run/secrets/kubernetes.io/serviceaccount/ca.crt, and
+    # > should be used to verify the serving certificate of the
+    # > apiserver.
+    # >
+    # > Finally, the default namespace to be used for namespaced
+    # > API operations is placed in a file at
+    # > /var/run/secrets/kubernetes.io/serviceaccount/namespace in
+    # > each container.
 
     @classmethod
     def from_kubeconfig(cls, kubeconfig=None, context=None, **kw):
@@ -73,6 +97,7 @@ class AK8sClient:
             kubeconfig = os.environ.get('KUBECONFIG')
             if kubeconfig is None:
                 kubeconfig = Path.home().joinpath('.kube/config')
+
         kubeconfig = Path(kubeconfig)
 
         with kubeconfig.open() as fh:
@@ -121,12 +146,12 @@ class AK8sClient:
         return AK8sClientAPIGroupBinding(self, api_group)
 
     async def op(self, op):
-        if op.body is not None:
-            headers, body = op.body_as('application/json')
-        else:
-            headers, body = {}, None
+        body, headers = None, {}
 
-        if op.response_model:
+        if op.body is not None:
+            body = ak8s_payload(op.body)
+
+        if 'application/json' in op.produces:
             headers['accept'] = 'application/json'
 
         url = urljoin(self._url, op.uri)
@@ -149,9 +174,8 @@ class AK8sClient:
                         raise AK8sNotFound(e.detail) from None
                 raise
 
-            if op.response_model:
-                if resp.content_type == 'application/json':
-                    return self._load_model(await resp.json())
+            if resp.content_type == 'application/json':
+                return self._load_model(await resp.json())
 
             if resp.content_type == 'text/plain':
                 return resp.text()
@@ -163,8 +187,8 @@ class AK8sClient:
     async def stream_op(self, op):
         headers = {}
 
-        if op.response_model:
-            headers['accept'] = 'application/json'
+        if 'application/json;stream=watch' in op.produces:
+            headers['accept'] = 'application/json;stream=watch'
 
         url = urljoin(self._url, op.uri)
 
@@ -185,20 +209,19 @@ class AK8sClient:
                         raise AK8sNotFound(e.detail) from None
                 raise
 
-            if op.response_model:
-                if resp.content_type == 'application/json':
-                    async for line in resp.content:
-                        ev = json.loads(line)
-                        type_ = ev['type']
-                        data = ev.get('object')
-                        if data is not None:
-                            obj = self._load_model(data)
-                            yield type_, obj
-                        else:
-                            yield type_, None
-                    self._logger.debug('end %(method)s %(path)s',
-                            dict(method=op.method, path=op.uri))
-                    return
+            if resp.content_type == 'application/json':
+                async for line in resp.content:
+                    ev = json.loads(line)
+                    type_ = ev['type']
+                    data = ev.get('object')
+                    if data is not None:
+                        obj = self._load_model(data)
+                        yield type_, obj
+                    else:
+                        yield type_, None
+                self._logger.debug('end %(method)s %(path)s',
+                        dict(method=op.method, path=op.uri))
+                return
 
             elif resp.content_type == 'text/plain':
                 # async yield from, where are you?
@@ -261,11 +284,9 @@ class AK8sClient:
                 pass # retry
 
     def _model_for_kind(self, data):
-        version = data['apiVersion']
-        if '/' in version:
-            # Change extensions/v1beta1 -> v1beta1
-            version = version.rsplit('/', 1)[1]
-        return self._models[f'{version}.{data["kind"]}']
+        group, _, version = data['apiVersion'].rpartition('/')
+        kind = data['kind']
+        return self._models[group, version, kind]
 
     def _load_model(self, data):
         model = self._model_for_kind(data)
@@ -278,12 +299,13 @@ class AK8sClientAPIGroupBinding:
         self._api_group = api_group
 
     def __getattr__(self, k):
-        if k in self._api_group:
-            return AK8sClientAPIBinding(self._ak8s, self._api_group[k])
-        raise AttributeError(k)
+        api = getattr(self._api_group, k)
+        if callable(api):
+            return AK8sClientAPIBinding(self._ak8s, api)
+        return self.__class__(self._ak8s, api)
 
     def __dir__(self):
-        yield from self._api_group
+        yield from dir(self._api_group)
 
 
 class AK8sClientAPIBinding:
@@ -314,6 +336,12 @@ class AK8sNotFound(Exception):
 
     def __str__(self):
         return self.detail.message
+
+
+def ak8s_payload(obj, content_type='application/json'):
+    if isinstance(obj, ModelBase):
+        return aiohttp.JsonPayload(obj._data, content_type=content_type)
+    raise TypeError(f'unsupported type for ak8s_payload: {obj.__class__}')
 
 
 if __name__ == '__main__':
