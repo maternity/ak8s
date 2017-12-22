@@ -309,17 +309,22 @@ class AK8sClientAPIGroupBinding:
 
 
 class AK8sClientAPIBinding:
-    __slots__ = ('_ak8s', '_api')
+    __slots__ = ('_ak8s', '_api', '_method')
 
-    def __init__(self, ak8s, api):
+    def __init__(self, ak8s, api, method=None):
         self._ak8s = ak8s
         self._api = api
+        self._method = method
 
     def __call__(self, *a, **kw):
         op = self._api(*a, **kw)
-        if op.stream:
-            return self._ak8s.stream_op(op)
-        return self._ak8s.op(op)
+        if self._method is not None:
+            method = getattr(self._ak8s, self._method)
+        elif op.stream:
+            method = self._ak8s.stream_op
+        else:
+            method = self._ak8s.op
+        return method(op)
 
     @property
     def __doc__(self):
@@ -328,6 +333,11 @@ class AK8sClientAPIBinding:
     @property
     def __signature__(self):
         return self._api.__signature__
+
+    def __getattr__(self, k):
+        if hasattr(self._ak8s, k):
+            return self.__class__(self._ak8s, self._api, k)
+        raise AttributeError(k)
 
 
 class AK8sNotFound(Exception):
