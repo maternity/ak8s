@@ -267,16 +267,44 @@ class AK8sClient:
         # now, but the 2.0 spec should provide a bit more structure, as well as
         # useful names for api groups (from tags).
 
-        last_version = op.args.get('resourceVersion') or ''
+        last_version = op.args.get('resourceVersion') or None
+        too_old_version = None
 
         while True:
             if last_version:
+                if too_old_version and last_version == too_old_version:
+                    last_version = None
                 op = op.replace(resourceVersion=last_version)
 
             try:
                 async for ev, obj in self.stream_op(op):
-                    if not last_version or int(last_version) < int(obj.metadata.resourceVersion):
-                        last_version = obj.metadata.resourceVersion
+                    if ev == 'ERROR':
+                        if obj.status == 'Failure' and obj.reason == 'Gone':
+                            # too old resource version
+                            # In this situation, either there is a newer
+                            # version or there isn't.  If there isn't a newer
+                            # version, then the error seems to be bogus.  If
+                            # there is a newer version, then the error means we
+                            # might miss continuity.  Either way, we should
+                            # resume from whatever is current.
+                            too_old_version = last_version
+                            self._logger.debug(
+                                    'Restarting %r because version '
+                                    '%r is too old',
+                                    op.uri, last_version)
+                            break
+                        self._logger.error('Watch %r: %s', op.uri, obj.message)
+
+                    else:
+                        if not last_version or int(obj.metadata.resourceVersion) > int(last_version):
+                            last_version = obj.metadata.resourceVersion
+
+                        # I think the first event will always be 'ADDED', but
+                        # I'm not sure.
+                        if ev == 'ADDED' and too_old_version and int(obj.metadata.resourceVersion) <= int(too_old_version):
+                            # If the resource version is too old and we had to
+                            # resume without, then discard the repeat events.
+                            continue
 
                     yield ev, obj
 
