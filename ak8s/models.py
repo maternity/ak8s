@@ -14,6 +14,7 @@
 
 import argparse
 import json
+import re
 import textwrap
 
 from .nestedns import NS
@@ -22,26 +23,41 @@ from .boilerplate import boilerplate
 
 def mklens(pdesc, *, registry):
     if '$ref' in pdesc:
-        return ModelLens(pdesc, registry=registry)
-    
-    if pdesc['type'] == 'array':
+        if registry._is_model(pdesc['$ref']):
+            # At this time, I haven't seen any model definitions that resolved
+            # to an array type.
+            return ModelLens(pdesc, registry=registry)
+
+        description = pdesc.get('description')
+        return SimpleLens(
+                registry._get_model_desc(pdesc['$ref']),
+                description=description)
+
+    if 'type' in pdesc and pdesc['type'] == 'array':
         itemlens = mklens(pdesc['items'], registry=registry)
-        return ListLens._binditem(itemlens, pdesc)
+        return ListLens(pdesc, itemlens=itemlens)
 
     return SimpleLens(pdesc)
 
 
 class SimpleLens:
-    def __init__(self, desc):
-        if 'description' in desc:
-            self.__doc__ = desc['description']
+    def __init__(self, desc, *, description=None):
+        if description is None:
+            description = desc.get('description')
+        if description is not None:
+            self.__doc__ = description
+        self._type = desc['type']
+        self._format = desc.get('format')
 
-    @classmethod
-    def _project(cls, data):
+    def __repr__(self):
+        if self._format:
+            return f'<{self.__class__.__name__} {self._type}: {self._format}>'
+        return f'<{self.__class__.__name__} {self._type}>'
+
+    def project(self, data):
         return data
 
-    @classmethod
-    def _unwrap(cls, value):
+    def unwrap(self, value):
         return value
 
 
@@ -50,17 +66,20 @@ class ModelLens:
         if 'description' in desc:
             self.__doc__ = desc['description']
         self._models = registry.models
-        self._ref = desc['$ref']
+        self._ref = re.sub(r'^#/definitions/', '', desc['$ref'])
         self._model = None
 
-    def _project(self, data):
+    def __repr__(self):
+        return f'<{self.__class__.__name__} {self._ref}>'
+
+    def project(self, data):
         if self._model is None:
             self._model = self._models[self._ref]
-        lens = object.__new__(self._model)
-        lens._data = data
-        return lens
+        obj = object.__new__(self._model)
+        obj._data = data
+        return obj
 
-    def _unwrap(self, value):
+    def unwrap(self, value):
         # value should be an instance of the model
         return value._data
 
@@ -79,29 +98,44 @@ class ModelRegistry:
     def __init__(self):
         self.models = NS(missing=self._get_model)
         self._model_desc = {}
+        self.models_by_gvk = NS(missing=self._get_model_by_gvk)
+        self._gvk_names = {}
 
     def load_spec(self, pth):
         with open(pth) as fh:
-            for ln in fh:
-                spec = json.loads(ln)
-                self.add_spec(spec)
+            spec = json.load(fh)
+            self.add_spec(spec)
 
     def add_spec(self, spec):
-        for desc in spec['models'].values():
-            self.add_model_desc(desc)
+        for name,desc in spec['definitions'].items():
+            self.add_model_desc(name, desc)
 
-    def add_model_desc(self, desc):
-        if desc['id'] in self._model_desc:
+    def add_model_desc(self, name, desc):
+        if name in self._model_desc:
             # Some models appear in multiple APIs, if the specs don't differ,
             # then ignore it.
-            if desc == self._model_desc[desc['id']]:
+            if desc == self._model_desc[name]:
                 return
-            raise KeyError(f'Spec for {desc["id"]} is already registered')
-        self._model_desc[desc['id']] = desc
-        self.models._declare_lazy(desc['id'])
+            raise KeyError(f'Spec for {name} is already registered')
+        self._model_desc[name] = desc
+        self.models._declare_lazy(name)
+        if 'x-kubernetes-group-version-kind' in desc:
+            for d in desc['x-kubernetes-group-version-kind']:
+                # This name isn't useful as a variable name, but we're lacking
+                # the tag aliases that map {group: '', version: 'v1'} ->
+                # core_v1.  So, the models_by_gvk interface is only useful for
+                # programattic access.
+                gvk_name = d['group'], d['version'], d['kind']
+                self._gvk_names[gvk_name] = name
+                self.models_by_gvk._declare_lazy(gvk_name)
 
-    def _get_model_desc(self, name):
-        return self._model_desc[name]
+    def _get_model_desc(self, name, *, resolve=True):
+        name = re.sub(r'^#/definitions/', '', name)
+        desc = self._model_desc[name]
+        if resolve:
+            while '$ref' in desc:
+                desc = registry._get_model_desc(desc['$ref'], resolve=False)
+        return desc
 
     def _register_model(self, model):
         if not issubclass(model, ModelBase):
@@ -110,9 +144,23 @@ class ModelRegistry:
         return model
 
     def _get_model(self, name):
+        desc = self._get_model_desc(name)
+
+        if '$ref' in desc:
+            ref = re.sub(r'^#/definitions/', '', desc['$ref'])
+            return self.models[ref]
+
         class Model(ModelBase, registry=self, name=name):
             __slots__ = ()
+
         return Model
+
+    def _get_model_by_gvk(self, gvk):
+        return self.models[self._gvk_names[gvk]]
+
+    def _is_model(self, name):
+        mdesc = self._get_model_desc(name)
+        return 'type' not in mdesc
 
 
 class ModelBase:
@@ -157,6 +205,12 @@ class ModelBase:
         for k,v in kw.items():
             setattr(self, k, v)
 
+    def __getstate__(self):
+        return self._data.copy()
+
+    def __setstate__(self, data):
+        self._data = data
+
     @classmethod
     def _project(cls, data):
         # elements of data are raw
@@ -196,34 +250,47 @@ class LensProp:
             return self
         if self.name in them._data:
             data = them._data[self.name]
-            return self.lens._project(data)
+            return self.lens.project(data)
 
     def __delete__(self, them):
         if self.name in them._data:
             del them._data[self.name]
 
     def __set__(self, them, values):
-        them._data[self.name] = self.lens._unwrap(values)
+        them._data[self.name] = self.lens.unwrap(values)
 
-
-# Three tools?
-# descriptors
-# lens configs
-# lens instances
-#
-# The descriptor provides __get__, __set__ and __delete__
-# The lens config provides project and unwrap functionality.
-# The lens is the actual projection class.
-# 
-# What's a better word for lens config?
 
 class ListLens:
+    def __init__(self, desc, *, itemlens):
+        self._itemlens = itemlens
+        self._bound = ListProxy(itemlens=itemlens)
+        if 'description' in desc:
+            self.__doc__ = desc['description']
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__} {self._itemlens}>'
+
+    def project(self, data):
+        return self._bound._project(data)
+
+    def unwrap(self, value):
+        return self._bound._unwrap(value)
+
+
+import collections
+class ListProxy(collections.MutableSequence):
+    # TODO: subclass/instance checks?
+
     # FIXME: Some methods compare projected values for equality, others compare
     # raw values.  Need to be consistent, justify any exceptions.
+    # Also, consider whether slice access should return a ListProxy instead of
+    # a plain list.  The argument for doing this is that a plain list can't be
+    # unwrapped.
 
-    __slots__ = '_data',
+    __slots__ = '_data', '_itemlens'
 
-    def __init__(self, seq=None):
+    def __init__(self, seq=None, *, itemlens):
+        self._itemlens = itemlens
         self._data = []
         if seq is not None:
             self[:] = seq
@@ -237,18 +304,16 @@ class ListLens:
             _itemlens = itemlens
         return BoundListLens
 
-    @classmethod
-    def _project(cls, data):
-        self = cls()
+    def _project(self, data):
+        self = self.__class__(itemlens=self._itemlens)
         if data is not None:
             self._data = data
         return self
 
-    @classmethod
-    def _unwrap(cls, value, *, gen=False):
+    def _unwrap(self, value, *, gen=False):
         if isinstance(value, ListLens):
             return value._data
-        iunwrap = cls._itemlens._unwrap
+        iunwrap = self._itemlens.unwrap
         if gen:
             return ( iunwrap(v) for v in value )
         return [ iunwrap(v) for v in value ]
@@ -258,16 +323,16 @@ class ListLens:
         if isinstance(key, slice):
             self._data[key] = self._unwrap(value, gen=True)
         else:
-            self._data[key] = self._itemlens._unwrap(value)
+            self._data[key] = self._itemlens.unwrap(value)
 
     def insert(self, index, value):
-        self._data.insert(index, self._itemlens._unwrap(value))
+        self._data.insert(index, self._itemlens.unwrap(value))
 
     def append(self, value):
-        self._data.append(self._itemlens._unwrap(value))
+        self._data.append(self._itemlens.unwrap(value))
 
     def extend(self, value):
-        self._data.extend(self._unwrap(values, gen=True))
+        self._data.extend(self._unwrap(value, gen=True))
 
     def __delitem__(self, key):
         del self._data[key]
@@ -276,7 +341,7 @@ class ListLens:
         self._data.clear()
 
     def remove(self, value):
-        self._data.remove(self._itemlens._unwrap(value))
+        self._data.remove(self._itemlens.unwrap(value))
 
     def pop(self, *a):
         return self._data.pop(*a)
@@ -285,12 +350,12 @@ class ListLens:
         self._data.reverse()
 
     def sort(self, key=None, reverse=False):
-        iproject = self._itemlens._project
+        iproject = self._itemlens.project
         if key is None:
             lenskey = iproject
         else:
             lenskey = lambda d: key(iproject(d))
-        self._data.sort(lenskey=key, reverse=reverse)
+        self._data.sort(key=lenskey, reverse=reverse)
 
     def __iadd__(self, them):
         self.extend(them)
@@ -300,38 +365,41 @@ class ListLens:
 
     ### Accessors
     def __iter__(self):
-        iproject = self._itemlens._project
+        iproject = self._itemlens.project
         return ( iproject(d) for d in self._data )
 
     def __getitem__(self, key):
-        iproject = self._itemlens._project
+        iproject = self._itemlens.project
         if isinstance(key, slice):
             return [ iproject(d) for d in self._data[key] ]
         else:
             return iproject(self._data[key])
 
+    def __len__(self):
+        return len(self._data)
+
     def __eq__(self, them):
-        iproject = self._itemlens._project
+        iproject = self._itemlens.project
         return len(self) == len(them) and all(
                 iproject(a)==b for a,b in zip(self._data, them) )
 
     def __repr__(self):
-        iproject = self._itemlens._project
+        iproject = self._itemlens.project
         vreprs = ', '.join( repr(iproject(d)) for d in self._data )
         return f'[{vreprs}]'
 
     __hash__ = None
 
     def __contains__(self, value):
-        iproject = self._itemlens._project
+        iproject = self._itemlens.project
         return any( iproject(d)==value for d in self._data )
 
     def count(self, value):
-        iproject = self._itemlens._project
+        iproject = self._itemlens.project
         return sum( iproject(d)==value for d in self._data )
 
     def index(self, value):
-        iproject = self._itemlens._project
+        iproject = self._itemlens.project
         try:
             return next(
                     i for i,d in enumerate(self._data)
@@ -359,4 +427,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     registry = ModelRegistry()
-    registry.load_spec(args.spec)
+    with open(args.spec) as fh:
+        spec = json.load(fh)
+        registry.add_spec(spec)
