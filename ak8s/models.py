@@ -134,7 +134,7 @@ class ModelRegistry:
         desc = self._model_desc[name]
         if resolve:
             while '$ref' in desc:
-                desc = registry._get_model_desc(desc['$ref'], resolve=False)
+                desc = self._get_model_desc(desc['$ref'], resolve=False)
         return desc
 
     def _register_model(self, model):
