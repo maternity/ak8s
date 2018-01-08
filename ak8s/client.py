@@ -313,6 +313,10 @@ class AK8sClient:
             except asyncio.TimeoutError:
                 pass # retry
 
+            except aiohttp.ClientPayloadError as err:
+                self._logger.exception('Watch %r', op.uri)
+                await asyncio.sleep(1) # retry
+
     def _model_for_kind(self, data):
         group, _, version = data['apiVersion'].rpartition('/')
         kind = data['kind']
