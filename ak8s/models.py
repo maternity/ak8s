@@ -144,7 +144,7 @@ class ModelRegistry:
         return model
 
     def _get_model(self, name):
-        desc = self._get_model_desc(name)
+        desc = self._get_model_desc(name, resolve=False)
 
         if '$ref' in desc:
             ref = re.sub(r'^#/definitions/', '', desc['$ref'])
