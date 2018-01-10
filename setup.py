@@ -1,4 +1,4 @@
-from setuptools import find_packages
+from pathlib import Path
 from setuptools import setup
 
 
@@ -9,7 +9,9 @@ if __name__ == '__main__':
             description='asyncio Kubernetes API client',
             author='Kai Groner',
             author_email='kai@gronr.com',
-            packages=find_packages(),
+            packages={
+                str(py.parent).replace('/', '.')
+                for py in Path('ak8s').rglob('*.py') },
             install_requires=[
                 'aiohttp>=2.3',
                 'pyyaml>=3.12',
