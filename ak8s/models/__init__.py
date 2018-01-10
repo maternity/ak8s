@@ -94,6 +94,10 @@ class ModelRegistry:
             ref = re.sub(r'^#/definitions/', '', desc['$ref'])
             return self.models[ref]
 
+        if 'type' in desc:
+            if desc['type'] == 'string':
+                return str
+
         class Model(ModelBase, registry=self, name=name):
             __slots__ = ()
 
