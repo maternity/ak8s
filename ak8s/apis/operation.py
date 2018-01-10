@@ -16,34 +16,17 @@ import argparse
 from inspect import Parameter
 from inspect import Signature
 import json
-from pathlib import Path
 import re
 import textwrap
 from types import MappingProxyType as mappingproxy
 from urllib.parse import urlencode
 from urllib.parse import urlunsplit
 
-from .models import ModelRegistry
-from .nestedns import NS
 
-
-# Customization points (things that can't be inferred from the spec)
-# - Gather arguments from context object (namespace and name don't have to be
-#   specified separately).
-# - Gather arguments from context object when that object is not the request
-#   or the response (DELETE requests, item watch operations, other subresources
-#   such as pod logs).
-# - PATCH requests (maybe can be done generically)
-#
-# Direct subclassing probably works well here, because you can just implement
-# __call__ and super with the adapted args.  The structure of the apilist is
-# not convenient though, so being able to reference the api by name is
-# desirable.
-#
-# Mixing explicitly defined classes with auto generated classes should be easy.
-#
-# The models form of this using mixins is ok, but I'd like to just define the
-# class and use mixins there, if I want them.
+__all__ = '''
+    K8sAPIOperations
+    StreamingMixin
+'''.split()
 
 
 class K8sAPIOperation:
@@ -226,95 +209,6 @@ class K8sAPIOperation:
         return headers, body
 
 
-class APIRegistry(ModelRegistry):
-    '''Registry of swagger spec derived models and APIs.
-
-    >>> registry = APIRegistry()
-    >>> with open('v1.json') as fh:
-    ...     spec = json.load(fh)
-    >>> registry.add_spec(spec)
-    >>> registry.models.v1.Container
-    <class 'models.v1.Container'>
-    >>> registry.apis['v1'].list_namespaced_pod
-    <class 'apis.listNamespacedPod'>
-    '''
-
-    def __init__(self):
-        super().__init__()
-        self.apis = NS(missing=self._get_api)
-        self._api_desc = {}
-        self._api_bases = []
-
-    def add_spec(self, spec):
-        super().add_spec(spec)
-        for pth, pthdesc in spec['paths'].items():
-            pathparams = pthdesc.get('parameters')
-            for method, opdesc in pthdesc.items():
-                if method == 'parameters':
-                    continue
-                self.add_api_desc(pth, pathparams, method, opdesc)
-
-    def add_api_desc(self, pth, pathparams, method, opdesc):
-        tag, = opdesc['tags']
-        tag = camel2snake(tag) # rbacAuthorization_v1
-        name = camel2snake(opdesc['operationId'])
-        if tag in name:
-            # 'create_core_v1namespaced_pod' -> 'core_v1.create_namespaced_pod'
-            name = re.sub(f'(\\w+)_{re.escape(tag)}_?(?!$)', f'{tag}.\\1_', name)
-        if name in self._api_desc:
-            raise KeyError(f'Spec for {name} is already registered')
-        self._api_desc[name] = pth, pathparams, method, opdesc
-        self.apis._declare_lazy(name)
-
-    def _get_api_desc(self, name):
-        return self._api_desc[name]
-
-    def _register_api(self, api):
-        if not issubclass(api, K8sAPIOperation):
-            raise TypeError('Only K8sAPIOperation derived APIs can be registered.')
-        self.apis[api.name] = api
-
-        return api
-
-    def _get_api(self, name):
-        for predicate, base_class in self._api_bases:
-            if predicate(self, name):
-                break
-
-        else:
-            base_class = K8sAPIOperation
-
-        class API(
-                base_class,
-                registry=self,
-                name=name):
-            pass
-
-        return API
-
-    def add_api_base(self, predicate, base_class=None):
-        '''Register a base class to be used for APIs when predicate matches.
-
-        The predicate signature is:
-
-            predicate(registry, name)
-
-        Predicates are evaluated in the reverse order they were registered in.
-        '''
-
-        if isinstance(predicate, str):
-            predicate = (lambda regex: lambda reg, name: re.fullmatch(regex, name))(predicate)
-
-        def register(base_class):
-            self._api_bases.insert(0, (predicate, base_class))
-            return base_class
-
-        if base_class is not None:
-            register(base_class)
-        else:
-            return register
-
-
 class StreamingMixin:
     stream = True
 
@@ -342,39 +236,3 @@ def format_param_doc(desc):
         doc = textwrap.indent(doc, '        ')
         return f'    {desc["name"]} ({type_}):\n{doc}\n\n'
     return f'    {desc["name"]} ({type_})\n\n'
-
-
-
-def camel2snake(s):
-    return re.sub(r'(?<=[a-z])([A-Z]+)', lambda m: '_'+m.group(0), s).lower()
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('spec', metavar='SPEC', type=Path, nargs='+')
-    args = parser.parse_args()
-
-    registry = APIRegistry()
-
-    @registry.add_api_base(r'(?:\w+\.)?watch\w+')
-    class K8sAPIWatchOperation(StreamingMixin, K8sAPIOperation):
-        pass
-
-    @registry.add_api_base(r'(?:\w+\.)?(?:read|list)\w+')
-    class K8sAPIReadItemOrCollectionOperation(
-            StreamingMixin.bind_stream_condition(lambda self: self.args.get('watch')),
-            K8sAPIOperation):
-        pass
-
-    @registry.add_api_base(r'readNamespacedPodLogs')
-    class K8sAPIPodLogOperation(
-            StreamingMixin.bind_stream_condition(lambda self: self.args.get('watch')),
-            K8sAPIOperation):
-        pass
-
-    for pth in args.spec:
-        if pth.is_dir():
-            for pth in pth.rglob('*.json'):
-                registry.load_spec(pth)
-        else:
-            registry.load_spec(pth)
