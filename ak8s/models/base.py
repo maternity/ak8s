@@ -34,7 +34,9 @@ class ModelBase:
             doc = "Doesn't look like anything to me."
         cls.__doc__ = f'{doc}\n\n'
 
-        for pname,pdesc in desc['properties'].items():
+        props = desc.get('properties') or {}
+
+        for pname,pdesc in props.items():
             lens = mklens(pdesc, registry=registry)
             prop = LensProp(lens, pdesc)
             setattr(cls, pname, prop)
