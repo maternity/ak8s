@@ -73,11 +73,10 @@ class NS:
             try:
                 v = self._missing(k)
             except LookupError:
-                pass
+                raise KeyError(k)
             else:
                 self[k] = v
                 return v
-        raise KeyError(k)
 
     def __delitem__(self, k):
         del self._data[k]
