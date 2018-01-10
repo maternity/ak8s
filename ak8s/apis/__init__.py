@@ -57,11 +57,14 @@ class APIRegistry(ModelRegistry):
     <class 'apis.listNamespacedPod'>
     '''
 
-    def __init__(self):
+    def __init__(self, *, release=None):
         super().__init__()
         self.apis = NS(missing=self._get_api)
         self._api_desc = {}
         self._api_bases = []
+
+        if release is not None:
+            self.load_release_spec(release)
 
     def add_spec(self, spec):
         super().add_spec(spec)

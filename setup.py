@@ -14,6 +14,9 @@ if __name__ == '__main__':
                 'aiohttp>=2.3',
                 'pyyaml>=3.12',
             ],
+            package_data={
+                'ak8s.data': [ 'release-*.json', ],
+            },
             python_requires='~=3.6',
             classifiers=[
                 #'License :: OSI Approved :: MIT License',

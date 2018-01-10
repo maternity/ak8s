@@ -16,6 +16,7 @@ import json
 import re
 
 from ..nestedns import NS
+from ..data import load as load_data
 
 from .base import ModelBase
 
@@ -31,16 +32,23 @@ class ModelRegistry:
     <class 'models.v1.Container'>
     '''
 
-    def __init__(self):
+    def __init__(self, *, release=None):
         self.models = NS(missing=self._get_model)
         self._model_desc = {}
         self.models_by_gvk = NS(missing=self._get_model_by_gvk)
         self._gvk_names = {}
 
+        if release is not None:
+            self.load_release_spec(release)
+
     def load_spec(self, pth):
         with open(pth) as fh:
             spec = json.load(fh)
             self.add_spec(spec)
+
+    def load_release_spec(self, release):
+        spec = json.loads(load_data(f'release-{release}.json'))
+        self.add_spec(spec)
 
     def add_spec(self, spec):
         for name,desc in spec['definitions'].items():

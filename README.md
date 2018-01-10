@@ -2,7 +2,7 @@
 
 ```python3
 async def main():
-    registry = APIRegistry()
+    registry = APIRegistry(release='1.9')
 
     # TODO: these should be part of a standard config
     @registry.add_api_base(r'(?:\w+\.)?watch\w+')
@@ -14,8 +14,6 @@ async def main():
             StreamingMixin.bind_stream_condition(lambda self: self.args.get('watch')),
             K8sAPIOperation):
         pass
-
-    registry.load_spec('release-1.9.json')
 
     async with AK8sClient.from_kubeconfig(registry=registry) as ak8s:
         apis = ak8s.bind_api_group(registry.apis)

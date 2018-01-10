@@ -22,10 +22,10 @@ from .operation import StreamingMixin
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('spec', metavar='SPEC', type=Path)
+    parser.add_argument('release', metavar='RELEASE')
     args = parser.parse_args()
 
-    registry = APIRegistry()
+    registry = APIRegistry(release=args.release)
 
     @registry.add_api_base(r'(?:\w+\.)?watch\w+')
     class K8sAPIWatchOperation(StreamingMixin, K8sAPIOperation):
@@ -42,5 +42,3 @@ if __name__ == '__main__':
             StreamingMixin.bind_stream_condition(lambda self: self.args.get('follow')),
             K8sAPIOperation):
         pass
-
-    registry.load_spec(args.spec)

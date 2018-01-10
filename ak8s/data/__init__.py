@@ -12,14 +12,9 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-import argparse
-
-from . import ModelRegistry
+from pathlib import Path
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('release', metavar='RELEASE')
-    args = parser.parse_args()
-
-    registry = ModelRegistry(release=args.release)
+def load(name):
+    datadir = Path(__loader__.get_filename()).parent
+    return __loader__.get_data(datadir/name)
