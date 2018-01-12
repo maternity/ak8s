@@ -15,7 +15,7 @@ async def main():
             K8sAPIOperation):
         pass
 
-    async with AK8sClient.from_kubeconfig(registry=registry) as ak8s:
+    async with AK8sClient(registry=registry) as ak8s:
         apis = ak8s.bind_api_group(registry.apis)
 
         # Async API call

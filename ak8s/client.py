@@ -31,15 +31,12 @@ from .models import ModelBase
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('spec', metavar='SPEC')
-    parser.add_argument('kubeconfig', metavar='KUBECONFIG', nargs='?')
     args = parser.parse_args()
 
     registry = APIRegistry()
     registry.load_spec(args.spec)
 
-    async with AK8sClient.from_kubeconfig(
-            args.kubeconfig,
-            registry=registry) as ak8s:
+    async with AK8sClient(registry=registry) as ak8s:
         apis = ak8s.bind_api_group(registry.apis)
 
         async for ev, obj in apis.core_v1.watch_pod_list_for_all_namespaces(
@@ -49,14 +46,43 @@ async def main():
 
 class AK8sClient:
     def __init__(
-            self, url, *,
-            ca_file,
-            client_cert_file,
-            client_key_file,
-            registry):
+            self, url=None, *,
+            registry,
+            **kw):
+        if not ('ca_file' in kw and (
+                ('client_cert_file' in kw and 'client_key_file' in kw) or
+                'token' in kw)):
+            sa_conf = self._read_serviceaccount()
+            kc_conf = self._read_kubeconfig()
+            if sa_conf:
+                kw = {**sa_conf, **kw}
+            elif kc_conf:
+                kw = {**kc_conf, **kw}
+
+        url = kw.pop('url', url)
+        ca_file = kw.pop('ca_file')
+        token = kw.pop('token', None)
+        client_cert_file = kw.pop('client_cert_file', None)
+        client_key_file = kw.pop('client_key_file', None)
+
+        for k in kw:
+            raise TypeError(
+                    f'AK8sClient() got an unexpected keyword argument {k!r}')
+
         sslcontext = ssl.create_default_context(cafile=ca_file)
-        sslcontext.load_cert_chain(client_cert_file, client_key_file)
+        if client_cert_file is not None and client_key_file is not None:
+            sslcontext.load_cert_chain(client_cert_file, client_key_file)
+
+        elif token is not None:
+            # 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+            assert all( c.isalnum() or c in '-._~+/=' for c in token )
+
+        else:
+            raise TypeError(
+                    'AK8sClient() requires client_cert_file and '
+                    'client_key_file or token to be provided.')
         self._url = url
+        self._token = token
         self._sslcontext = sslcontext
         self._session = None
         self._models = registry.models_by_gvk
@@ -92,11 +118,13 @@ class AK8sClient:
     # > each container.
 
     @classmethod
-    def from_kubeconfig(cls, kubeconfig=None, context=None, **kw):
+    def _read_kubeconfig(cls, kubeconfig=None, context=None):
         if kubeconfig is None:
             kubeconfig = os.environ.get('KUBECONFIG')
             if kubeconfig is None:
-                kubeconfig = Path.home().joinpath('.kube/config')
+                kubeconfig = Path.home()/'.kube/config'
+                if not kubeconfig.is_file():
+                    return
 
         kubeconfig = Path(kubeconfig)
 
@@ -127,12 +155,24 @@ class AK8sClient:
         else:
             raise RuntimeError(f'User {ctx["user"]} was not found in {kubeconfig}')
 
-        return cls(
-                cluster['server'],
+        return dict(
+                url=cluster['server'],
                 ca_file=kubeconfig.parent/cluster['certificate-authority'],
                 client_cert_file=kubeconfig.parent/user['client-certificate'],
-                client_key_file=kubeconfig.parent/user['client-key'],
-                **kw)
+                client_key_file=kubeconfig.parent/user['client-key'])
+
+    @classmethod
+    def _read_serviceaccount(cls):
+        sa_dir = Path('/var/run/secrets/kubernetes.io/serviceaccount')
+        if not sa_dir.is_dir():
+            return
+        token_file = sa_dir/'token'
+        ca_file = sa_dir/'ca.crt'
+        #ns_file = sa_dir/'namespace'
+        return dict(
+                url='https://kubernetes.default',
+                ca_file=ca_file,
+                token=token_file.read_text())
 
     async def __aenter__(self):
         self._session = await aiohttp.ClientSession(
@@ -146,8 +186,13 @@ class AK8sClient:
     def bind_api_group(self, api_group):
         return AK8sClientAPIGroupBinding(self, api_group)
 
+    def _set_authorization(self, headers):
+        if self._token is not None:
+            headers.update(authorization=f'Bearer {self._token}')
+
     async def op(self, op):
         body, headers = None, {}
+        self._set_authorization(headers)
 
         if op.body is not None:
             body = ak8s_payload(op.body)
@@ -187,6 +232,7 @@ class AK8sClient:
 
     async def stream_op(self, op):
         headers = {}
+        self._set_authorization(headers)
 
         if 'application/json;stream=watch' in op.produces:
             headers['accept'] = 'application/json;stream=watch'
