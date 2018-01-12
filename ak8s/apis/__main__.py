@@ -13,7 +13,6 @@
 #   limitations under the License.
 
 import argparse
-from pathlib import Path
 
 from . import APIRegistry
 from .operation import K8sAPIOperation
