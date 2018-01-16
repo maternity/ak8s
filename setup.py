@@ -5,7 +5,7 @@ from setuptools import setup
 if __name__ == '__main__':
     setup(
             name='ak8s',
-            version='0.1.5',
+            version='0.1.7',
             description='asyncio Kubernetes API client',
             author='Kai Groner',
             author_email='kai@gronr.com',
